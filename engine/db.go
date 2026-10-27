@@ -30,6 +30,7 @@ type indexEntry struct {
 // DB is safe for concurrent use. Do not copy it or mutate inputs during calls.
 type DB struct {
 	mu     sync.RWMutex
+	dir    string
 	file   dataFile
 	lock   *os.File
 	index  map[string]indexEntry
@@ -52,6 +53,10 @@ func Open(dir string) (*DB, error) {
 }
 
 func openWith(dir string, openData func(string, int, os.FileMode) (dataFile, error), syncDir func(*os.File) error) (_ *DB, err error) {
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve database directory: %w", err)
+	}
 	directory, lock, err := lockDirectory(dir)
 	if err != nil {
 		return nil, err
@@ -66,11 +71,22 @@ func openWith(dir string, openData func(string, int, os.FileMode) (dataFile, err
 			err = errors.Join(err, unlockDirectory(lock))
 		}
 	}()
+	lockInfo, err := lock.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("read initialization state: %w", err)
+	}
 
 	path := filepath.Join(dir, dataFileName)
 	file, err = openData(path, os.O_RDWR|os.O_APPEND, 0600)
 	created := false
 	if errors.Is(err, os.ErrNotExist) {
+		artifacts, scanErr := hasCompactionArtifacts(dir)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if lockInfo.Size() != 0 || artifacts {
+			return nil, fmt.Errorf("%w: %s missing from an initialized or interrupted database", ErrCorrupt, dataFileName)
+		}
 		file, err = openData(path, os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_EXCL, 0600)
 		created = err == nil
 	}
@@ -99,7 +115,10 @@ func openWith(dir string, openData func(string, int, os.FileMode) (dataFile, err
 	if err = syncDir(directory); err != nil {
 		return nil, fmt.Errorf("sync database directory: %w", err)
 	}
-	return &DB{file: file, lock: lock, index: index, offset: end}, nil
+	if err = markInitialized(lock); err != nil {
+		return nil, err
+	}
+	return &DB{dir: dir, file: file, lock: lock, index: index, offset: end}, nil
 }
 
 // Set synchronizes a value before publishing it. An error does not imply rollback.
@@ -135,14 +154,22 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	rec, next, err := readRecordAt(db.file, entry.offset, db.offset)
+	rec, err := db.readEntry(string(key), entry)
 	if err != nil {
-		return nil, db.markFault(fmt.Errorf("read key at offset %d: %w", entry.offset, err))
-	}
-	if rec.kind != kindSet || next-entry.offset != entry.size || !bytes.Equal(rec.key, key) {
-		return nil, db.markFault(fmt.Errorf("%w: index/record mismatch at offset %d", ErrCorrupt, entry.offset))
+		return nil, db.markFault(err)
 	}
 	return rec.value, nil
+}
+
+func (db *DB) readEntry(key string, entry indexEntry) (record, error) {
+	rec, next, err := readRecordAt(db.file, entry.offset, db.offset)
+	if err != nil {
+		return record{}, fmt.Errorf("read key at offset %d: %w", entry.offset, err)
+	}
+	if rec.kind != kindSet || next-entry.offset != entry.size || !bytes.Equal(rec.key, []byte(key)) {
+		return record{}, fmt.Errorf("%w: index/record mismatch at offset %d", ErrCorrupt, entry.offset)
+	}
+	return rec, nil
 }
 
 func (db *DB) Exists(key []byte) (bool, error) {

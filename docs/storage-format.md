@@ -38,6 +38,14 @@ Replay starts at offset 16. A set record replaces the key's index entry with its
 
 The in-memory index stores keys and record locations, not values. `Get` uses a positional read and validates the record checksum, kind, size, and key against the index entry. These checks also detect corruption introduced after startup when the affected key is read. `Exists` only checks the index.
 
+Manual compaction uses the same version 1 format. It validates and copies only current live set records, rebuilding offsets in a replacement index. Obsolete versions and tombstones are omitted because the replacement is a complete logical snapshot of this single data file. The file-format version does not change.
+
+## Directory files
+
+`data.log` remains the only source of key/value records. The separate persistent `LOCK` file coordinates exclusive ownership and carries a one-byte successful-initialization marker. This marker is not part of the log format and does not contain recovery offsets or record state. Preserve both files when copying a closed database directory.
+
+Compaction creates sibling `.compact-*` temporary files containing the same log format. A temporary filename does not make its contents authoritative. Startup validates `data.log` and never promotes or automatically removes these artifacts. A missing data file combined with a nonempty `LOCK` or any compaction artifact is rejected instead of initialized; see the [replacement protocol](compaction-design.md).
+
 ## Incomplete and corrupt records
 
 - A nonempty incomplete final header or payload returns `ErrTruncated`.
