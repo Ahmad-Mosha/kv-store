@@ -155,6 +155,26 @@ Limiter state resets on restart. The upstream implementation periodically remove
 
 On shutdown, the server stops accepting connections, closes idle connections, and allows admitted commands and their responses to finish. After the configured deadline, it closes remaining connections and exits with an error. Filesystem I/O cannot be canceled by closing a socket. If drain times out, the command skips a blocking database close and lets process exit release resources. A lost response, write failure, or timeout can leave a mutation's outcome uncertain; reconnect and inspect application state rather than assuming rollback.
 
+## Performance
+
+Local measurements on an Apple M1 Pro, 16 GiB RAM, internal APFS SSD, macOS 26.5.2, and Go 1.26.0. Values below are medians of five runs with a 500 ms benchmark target at `GOMAXPROCS=1`, with warm OS caches.
+
+| Operation | Workload | Median per operation |
+|---|---|---:|
+| Get | 1 KiB value, 1,024 live keys | 1.184 µs |
+| Set | 1 KiB value, append + file `Sync` | 4.310 ms |
+| Recovery | Full Open + Close, 1,000 records | 7.601 ms |
+| Recovery | Full Open + Close, 10,000 records | 25.676 ms |
+| Compaction | 10,000 SETs, 500 DELETEs, 500 live keys | 12.021 ms |
+
+Per-write synchronization dominates small writes on this machine. Additional workers did not improve the measured embedded read workload; the TCP workload benefited from multiple clients. Compaction reduced its fixture's logical log length from 2,980,016 to 148,016 bytes while holding the exclusive lock. These are observations of this environment, not deployment capacity or power-loss guarantees.
+
+The [benchmark report](docs/benchmarks.md) includes sync overhead, concurrency, TCP results, allocation counts, observed ranges, exact fixtures, and all 170 raw samples. Reproduce with:
+
+```sh
+go test -p 1 ./engine ./internal/server -run '^$' -bench . -benchmem -benchtime=500ms -count=5 -cpu=1,4
+```
+
 ## Verification
 
 ```sh
@@ -163,9 +183,10 @@ go vet ./...
 go build ./...
 go test -race -cover ./...
 go test ./engine -run '^$' -fuzz '^FuzzDecodeRecord$' -fuzztime 10s
+go test ./internal/protocol -run '^$' -fuzz '^FuzzReadFrames$' -fuzztime 10s
 ```
 
-The test suite exercises serialization, truncation and corruption, reopen behavior, concurrent access, a reference-map workload, process locking, process termination, and injected I/O failures. Compaction tests cover logical-state preservation, replacement-stage failures, cleanup errors, and process termination around replacement. Protocol and networking tests cover framing, malformed and oversized input, request limits, connection lifecycle, deadlines, shutdown, CLI behavior, and restart persistence. CI runs formatting, vet, build, and race-enabled tests on Linux and macOS. Passing race tests covers executed code paths; it is not a proof that every possible execution is race-free.
+The test suite exercises serialization, truncation and corruption, reopen behavior, concurrent access, a reference-map workload, process locking, process termination, and injected I/O failures. Compaction tests cover logical-state preservation, replacement-stage failures, cleanup errors, and process termination around replacement. Protocol and networking tests cover framing, malformed and oversized input, request limits, connection lifecycle, deadlines, shutdown, CLI behavior, and restart persistence. CI runs formatting, vet, build, race-enabled tests, and a benchmark smoke run on Linux and macOS. Passing race tests covers executed code paths; it is not a proof that every possible execution is race-free.
 
 ## Repository structure
 
@@ -182,11 +203,9 @@ go.mod                  Go module and dependency versions
 
 The public `engine` package owns persistence and concurrency. Internal packages keep transport and request handling separate from storage. Executables compose those packages and own process-level resources. Tests live beside the code they exercise.
 
-## Limits and next milestones
+## Scope and limitations
 
 The current engine uses one data file and synchronizes each mutation separately. Writes and compaction exclude readers. Recovery scans the entire log, and the index consumes memory proportional to the number and size of live keys. Updates and deletions accumulate obsolete records until manual compaction. Compaction needs extra disk space for the replacement and temporarily retains both indexes in memory. Locks are advisory: external programs must not modify files behind an open database.
-
-The remaining milestone is reproducible benchmarks and a final engineering review. Measurements will cover sync overhead, reads/writes, recovery, concurrency, and compaction; no performance results are published yet.
 
 TTL, distributed operation, multi-key transactions, and background compaction are outside the MVP.
 
