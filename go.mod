@@ -1,0 +1,5 @@
+module github.com/Ahmad-Mosha/kv-store
+
+go 1.25.0
+
+require golang.org/x/sys v0.30.0
