@@ -1,4 +1,4 @@
-package diskkv
+package engine
 
 import (
 	"errors"
@@ -21,8 +21,7 @@ func recoverIndex(file dataFile) (map[string]indexEntry, int64, error) {
 	return index, end, err
 }
 
-// scanLog returns the last complete boundary, including on a malformed tail.
-// The caller must never interpret arbitrary I/O errors as repairable truncation.
+// On failure, the returned offset is the last complete record boundary.
 func scanLog(file dataFile, visit func(record, int64, int64)) (int64, error) {
 	info, err := file.Stat()
 	if err != nil {
@@ -53,11 +52,8 @@ func scanLog(file dataFile, visit func(record, int64, int64)) (int64, error) {
 	return offset, nil
 }
 
-// RepairTail explicitly discards a structurally incomplete final record. It
-// requires exclusive access and never creates a missing database. Bad checksums,
-// invalid lengths, unsupported versions, and incomplete file headers are refused.
-// This is a salvage policy, not proof that discarded bytes were unacknowledged.
-// The returned count reports bytes truncated, even if the following Sync fails.
+// RepairTail salvages an incomplete final record; it refuses corruption.
+// The byte count reports truncation even if the following Sync fails.
 func RepairTail(dir string) (discarded int64, err error) {
 	directory, lock, err := lockDirectory(dir)
 	if err != nil {

@@ -1,6 +1,6 @@
 //go:build linux || darwin
 
-package diskkv
+package engine
 
 import (
 	"errors"
@@ -24,8 +24,7 @@ func lockDirectory(dir string) (*os.File, *os.File, error) {
 		}
 		return nil, nil, fmt.Errorf("database directory: %w", err)
 	}
-	// LOCK has a stable inode, separate from data.log. Never unlink it: doing so
-	// would let another opener acquire a different lock at the same pathname.
+	// Never unlink LOCK: another opener could then lock a different inode.
 	lock, err := os.OpenFile(filepath.Join(dir, "LOCK"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		directory.Close()

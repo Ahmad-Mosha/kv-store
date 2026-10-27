@@ -1,4 +1,4 @@
-package diskkv
+package engine
 
 import (
 	"bytes"
@@ -9,9 +9,7 @@ import (
 )
 
 const (
-	// MaxKeySize is the maximum key length in bytes. Keys must not be empty.
-	MaxKeySize = 4 << 10
-	// MaxValueSize is the maximum value length in bytes. Empty values are valid.
+	MaxKeySize   = 4 << 10
 	MaxValueSize = 1 << 20
 
 	fileHeaderSize   = 16
@@ -89,9 +87,7 @@ func encodeRecord(kind recordKind, key, value []byte) ([]byte, error) {
 	return encoded, nil
 }
 
-// readRecordAt reads a single bounded record without modifying a shared file
-// cursor. end is the exclusive upper bound known to the caller. The fixed-size
-// header has its own checksum so corrupt lengths are rejected before allocation.
+// end is exclusive; lengths are validated before allocating the payload.
 func readRecordAt(r io.ReaderAt, offset, end int64) (record, int64, error) {
 	if offset < 0 || end < offset {
 		return record{}, 0, fmt.Errorf("%w: invalid record bounds", ErrCorrupt)
@@ -124,8 +120,7 @@ func readRecordAt(r io.ReaderAt, offset, end int64) (record, int64, error) {
 	if keyLen == 0 || keyLen > MaxKeySize || valueLen > MaxValueSize || (kind == kindDelete && valueLen != 0) {
 		return record{}, 0, fmt.Errorf("%w: invalid record lengths at offset %d", ErrCorrupt, offset)
 	}
-	// Convert only after enforcing the format limits. Comparing the span against
-	// end-offset avoids overflowing offset when inputs approach MaxInt64.
+	// Subtract bounds to avoid overflowing offset + span.
 	payloadLen := int64(keyLen) + int64(valueLen)
 	span := int64(recordHeaderSize) + payloadLen
 	if span > end-offset {
@@ -152,7 +147,6 @@ func readExactAt(r io.ReaderAt, buf []byte, offset int64) error {
 	if err != nil {
 		return err
 	}
-	// A short read without an error violates io.ReaderAt's contract. Do not
-	// classify it as a repairable tail: the underlying reader has malfunctioned.
+	// A broken ReaderAt must not be mistaken for repairable truncation.
 	return io.ErrNoProgress
 }

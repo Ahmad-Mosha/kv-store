@@ -1,6 +1,6 @@
 //go:build !linux && !darwin
 
-package diskkv
+package engine
 
 import (
 	"fmt"

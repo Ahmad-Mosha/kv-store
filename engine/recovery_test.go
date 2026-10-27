@@ -1,4 +1,4 @@
-package diskkv
+package engine
 
 import (
 	"bufio"
@@ -198,8 +198,6 @@ func TestOpenInitializationFailuresReleaseLock(t *testing.T) {
 				t.Fatalf("openWith error = %v", err)
 			}
 			if stage == "write" {
-				// Explicitly remove the failed new file; Open must not silently
-				// initialize a file left empty by a failed prior initialization.
 				if err := os.Remove(filepath.Join(dir, dataFileName)); err != nil {
 					t.Fatal(err)
 				}
@@ -264,8 +262,7 @@ func TestDirectoryLockAcrossProcesses(t *testing.T) {
 }
 
 func TestAcknowledgedMutationsSurviveProcessKill(t *testing.T) {
-	// Killing this child does not clear the kernel page cache or simulate power
-	// loss. The test establishes process-crash recovery only.
+	// A process kill leaves the kernel cache alive; this is not a power-loss test.
 	dir := t.TempDir()
 	child := startProcessHelper(t, "write", dir)
 	if err := child.Process.Kill(); err != nil {
@@ -303,7 +300,6 @@ func TestStorageProcessHelper(t *testing.T) {
 		}
 	}
 	fmt.Println("ready")
-	// The parent keeps stdin open until it kills this process. No Close runs.
 	if _, err := io.Copy(io.Discard, os.Stdin); err != nil {
 		t.Fatal(err)
 	}

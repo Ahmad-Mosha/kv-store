@@ -1,4 +1,4 @@
-package diskkv
+package engine
 
 import "errors"
 

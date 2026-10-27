@@ -50,14 +50,14 @@ import (
     "log"
     "os"
 
-    diskkv "github.com/Ahmad-Mosha/kv-store"
+    "github.com/Ahmad-Mosha/kv-store/engine"
 )
 
 func main() {
     if err := os.MkdirAll("data", 0700); err != nil {
         log.Fatal(err)
     }
-    db, err := diskkv.Open("data")
+    db, err := engine.Open("data")
     if err != nil {
         log.Fatal(err)
     }
@@ -76,7 +76,7 @@ func main() {
         log.Print(err)
         return
     }
-    fmt.Println(string(value)) // Cairo
+    fmt.Println(string(value))
 }
 ```
 
@@ -113,10 +113,21 @@ test -z "$(gofmt -l .)"
 go vet ./...
 go build ./...
 go test -race -cover ./...
-go test -run '^$' -fuzz '^FuzzDecodeRecord$' -fuzztime 10s
+go test ./engine -run '^$' -fuzz '^FuzzDecodeRecord$' -fuzztime 10s
 ```
 
 The test suite exercises serialization, truncation and corruption, reopen behavior, concurrent access, a reference-map workload, process locking, process termination, and injected I/O failures. CI runs formatting, vet, build, and race-enabled tests on Linux and macOS. Passing race tests covers executed code paths; it is not a proof that every possible execution is race-free.
+
+## Repository structure
+
+```text
+engine/                 Storage engine, record codec, recovery, and colocated tests
+docs/                   Storage format, durability contract, and compaction design
+.github/workflows/      Continuous integration
+go.mod                  Go module and dependency versions
+```
+
+The public `engine` package owns persistence and concurrency. Its tests live beside the code they exercise. Documentation describes current guarantees and explicitly labels future work; server and CLI packages will be added with their implementation milestone.
 
 ## Limits and next milestones
 

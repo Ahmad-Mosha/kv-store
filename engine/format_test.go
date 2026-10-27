@@ -1,4 +1,4 @@
-package diskkv
+package engine
 
 import (
 	"bytes"
@@ -12,8 +12,6 @@ import (
 )
 
 func TestFormatGolden(t *testing.T) {
-	// Fixed vectors protect the persisted format against accidental byte-order,
-	// checksum-polynomial, and layout changes.
 	if got := hex.EncodeToString(encodeFileHeader()); got != "4449534b4b56000000000001b84d6035" {
 		t.Fatalf("file header = %s", got)
 	}
@@ -71,7 +69,6 @@ func TestRecordRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// Prefix and suffix exercise nonzero offsets and exact record bounds.
 			data := append([]byte("prefix"), encoded...)
 			end := int64(len(data))
 			data = append(data, []byte("suffix")...)
@@ -122,7 +119,6 @@ func TestRecordTruncationAtEveryByte(t *testing.T) {
 			t.Errorf("length %d: got %v, want truncation", length, err)
 		}
 	}
-	// A stale upper bound must also detect EOF from the underlying reader.
 	for _, length := range []int{recordHeaderSize - 1, recordHeaderSize, len(encoded) - 1} {
 		_, _, err := readRecordAt(bytes.NewReader(encoded[:length]), 0, int64(len(encoded)))
 		if !errors.Is(err, ErrTruncated) {

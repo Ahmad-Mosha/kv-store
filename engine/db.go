@@ -1,6 +1,5 @@
-// Package diskkv implements a single-process, persistent key-value store.
-// Successful mutations are synchronized to the data file before becoming visible.
-package diskkv
+// Package engine implements an append-only persistent key-value store.
+package engine
 
 import (
 	"bytes"
@@ -14,7 +13,6 @@ import (
 
 const dataFileName = "data.log"
 
-// dataFile is the narrow I/O boundary used to test short writes and sync failures.
 type dataFile interface {
 	io.ReaderAt
 	io.Writer
@@ -29,9 +27,7 @@ type indexEntry struct {
 	size   int64
 }
 
-// DB owns the log and an exclusive advisory directory lock. It is safe for
-// concurrent use. Callers must not modify input slices while a method uses them.
-// A DB must not be copied after its first use.
+// DB is safe for concurrent use. Do not copy it or mutate inputs during calls.
 type DB struct {
 	mu     sync.RWMutex
 	file   dataFile
@@ -39,16 +35,12 @@ type DB struct {
 	index  map[string]indexEntry
 	offset int64
 	closed bool
-	// A reader must be able to publish a fault before dropping its read lock,
-	// so no writer can acknowledge data behind known storage corruption.
+	// Read failures must be published before releasing mu.RLock.
 	faultMu sync.Mutex
 	fault   error
 }
 
-// Open opens a database in an existing directory, creating data.log if absent.
-// It validates the entire log before exposing any data and never repairs a
-// corrupt or incomplete existing file. Use RepairTail explicitly for an
-// incomplete final record. Only Linux and macOS local filesystems are supported.
+// Open validates or creates data.log in an existing directory. It never repairs data.
 func Open(dir string) (*DB, error) {
 	return openWith(dir, func(path string, flags int, mode os.FileMode) (dataFile, error) {
 		file, err := os.OpenFile(path, flags, mode)
@@ -100,8 +92,7 @@ func openWith(dir string, openData func(string, int, os.FileMode) (dataFile, err
 	if err != nil {
 		return nil, err
 	}
-	// Also sync recovered records: a previous process may have appended a full
-	// record without acknowledging it or completing its own sync.
+	// Recovered records may have been appended without completing Sync.
 	if err = file.Sync(); err != nil {
 		return nil, fmt.Errorf("sync opened data file: %w", err)
 	}
@@ -111,9 +102,7 @@ func openWith(dir string, openData func(string, int, os.FileMode) (dataFile, err
 	return &DB{file: file, lock: lock, index: index, offset: end}, nil
 }
 
-// Set appends a replacement value. It publishes the new index entry only after
-// the complete record and its Sync succeed. A failed mutation may nevertheless
-// be recovered on reopen; an error is not a guarantee that nothing was written.
+// Set synchronizes a value before publishing it. An error does not imply rollback.
 func (db *DB) Set(key, value []byte) error {
 	encoded, err := encodeRecord(kindSet, key, value)
 	if err != nil {
@@ -132,8 +121,7 @@ func (db *DB) Set(key, value []byte) error {
 	return nil
 }
 
-// Get returns an independent copy of a value, or ErrNotFound. It verifies the
-// record checksum and identity on every read, not only during startup recovery.
+// Get returns owned bytes and validates the stored record.
 func (db *DB) Get(key []byte) ([]byte, error) {
 	if err := validateKey(key); err != nil {
 		return nil, err
@@ -157,7 +145,6 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return rec.value, nil
 }
 
-// Exists reports index membership without reading the stored value.
 func (db *DB) Exists(key []byte) (bool, error) {
 	if err := validateKey(key); err != nil {
 		return false, err
@@ -171,7 +158,7 @@ func (db *DB) Exists(key []byte) (bool, error) {
 	return ok, nil
 }
 
-// Delete appends a tombstone for an existing key. A missing key is a no-op.
+// Delete is a no-op for a missing key.
 func (db *DB) Delete(key []byte) error {
 	encoded, err := encodeRecord(kindDelete, key, nil)
 	if err != nil {
@@ -199,9 +186,6 @@ func validateKey(key []byte) error {
 	return nil
 }
 
-// appendRecord is called only under the exclusive lock. Never append another
-// record behind a failed write: that could turn a repairable tail into interior
-// corruption, or create a second history behind an unpublished durable record.
 func (db *DB) appendRecord(encoded []byte) error {
 	n, err := db.file.Write(encoded)
 	if err == nil && n != len(encoded) {
@@ -211,6 +195,7 @@ func (db *DB) appendRecord(encoded []byte) error {
 		err = db.file.Sync()
 	}
 	if err != nil {
+		// Later appends could turn an incomplete tail into interior corruption.
 		return db.markFault(fmt.Errorf("mutation outcome uncertain: %w", err))
 	}
 	db.offset += int64(len(encoded))
@@ -229,7 +214,7 @@ func (db *DB) checkState() error {
 	return nil
 }
 
-// The caller holds mu (read or write). Lock ordering is always mu -> faultMu.
+// Lock order: mu (read or write) before faultMu.
 func (db *DB) markFault(err error) error {
 	db.faultMu.Lock()
 	defer db.faultMu.Unlock()
@@ -239,9 +224,7 @@ func (db *DB) markFault(err error) error {
 	return fmt.Errorf("%w: %w", ErrFaulted, err)
 }
 
-// Close waits for active operations, closes the log, and releases its lock even
-// if closing the log fails. Repeated calls are harmless. It does not turn an
-// earlier failed mutation into a successful one.
+// Close waits for active calls and releases ownership, even after an I/O failure.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()

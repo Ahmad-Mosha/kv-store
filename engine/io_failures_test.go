@@ -1,4 +1,4 @@
-package diskkv
+package engine
 
 import (
 	"bytes"
@@ -151,8 +151,7 @@ func TestConcurrentReadFailuresPublishFaultBeforeUnlock(t *testing.T) {
 	for range 2 {
 		go func() { _, err := db.Get([]byte("key")); results <- err }()
 	}
-	// Both readers hold RLock before either publishes its failure. Race detection
-	// therefore exercises the fault state under concurrent shared locks.
+	// Both readers hold RLock when the injected failures are released.
 	<-entered
 	<-entered
 	close(release)

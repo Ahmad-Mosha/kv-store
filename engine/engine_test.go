@@ -1,4 +1,4 @@
-package diskkv
+package engine
 
 import (
 	"bytes"
@@ -405,8 +405,7 @@ func TestDBFailedDeleteDoesNotPublishTombstone(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// A complete but unacknowledged tombstone can be recovered after a failed
-	// Sync: the original error must not be interpreted as a rollback.
+	// A failed Sync does not roll back a complete tombstone.
 	assertMissing(t, openTestDB(t, dir), []byte("key"))
 }
 
