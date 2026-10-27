@@ -2,7 +2,7 @@
 
 A persistent key-value storage engine in Go, built around an append-only data log, a rebuildable in-memory index, and explicit failure handling.
 
-DiskKV currently provides an **embedded storage engine**. Each successful mutation is synchronized to the data file before its index entry becomes visible. Startup validates the log rather than silently discarding damaged records.
+DiskKV provides an **embedded storage engine and a bounded TCP server**, with a command-line client and per-IP request limits. Each successful mutation is synchronized to the data file before its index entry becomes visible. Startup validates the log rather than silently discarding damaged records.
 
 ## Implemented
 
@@ -13,14 +13,18 @@ DiskKV currently provides an **embedded storage engine**. Each successful mutati
 - Strict recovery, explicit incomplete-tail repair, and a faulted state after storage failures.
 - Exclusive advisory locking on Linux and macOS.
 - Manual compaction with synchronized file replacement and replacement-stage fault injection.
-
-Networking, the CLI, and rate limiting are later milestones. They are not part of the current API.
+- A newline-delimited JSON protocol for binary-safe `SET`, `GET`, `DELETE`, and `EXISTS` commands.
+- Connection, frame-size, and network deadline limits, with graceful shutdown of admitted requests.
+- Per-IP token buckets from the existing [Go Rate Limiter](https://github.com/Ahmad-Mosha/rate-limiter) module.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Caller[Go caller] --> Engine[DiskKV engine]
+    CLI[CLI / TCP client] --> Protocol[Bounded JSON protocol]
+    Protocol --> Limits[Per-IP rate limiter]
+    Limits --> Engine[DiskKV engine]
+    Caller[Go caller] --> Engine
     Engine --> Index[In-memory index]
     Engine --> Log[Append-only data.log]
     Log --> Recovery[Validated startup replay]
@@ -41,9 +45,32 @@ Requirements: Go 1.25 or later, Linux or macOS, and a local filesystem that supp
 git clone https://github.com/Ahmad-Mosha/kv-store.git
 cd kv-store
 go test -race ./...
+go build -o ./bin/diskkv ./cmd/diskkv
+go build -o ./bin/diskkv-cli ./cmd/diskkv-cli
+./bin/diskkv -data ./data
 ```
 
-Use the engine from a Go program:
+In another terminal:
+
+```sh
+./bin/diskkv-cli set city Cairo
+./bin/diskkv-cli get city
+./bin/diskkv-cli exists city
+./bin/diskkv-cli delete city
+```
+
+These commands print `OK`, `Cairo`, `true`, and `OK`. Stop the server with Ctrl-C; reopening the same data directory recovers its log. The server creates the data directory when needed and listens on `127.0.0.1:7379` by default. It provides no authentication or TLS; use it only on a trusted local interface or through a separately secured connection.
+
+Flags precede the CLI command. `-base64` accepts base64-encoded keys and SET values and prints GET results as base64:
+
+```sh
+./bin/diskkv-cli -base64 set YmluYXJ5 AP8K
+./bin/diskkv-cli -base64 get YmluYXJ5
+```
+
+The second command prints `AP8K`. Plain GET output is the stored bytes followed by a newline. Missing keys, rate limits, invalid responses, and network failures return a nonzero exit status. The CLI uses one connection and a five-second total timeout per invocation; it never retries a request automatically. The [protocol reference](docs/protocol.md) defines framing, errors, configuration, and shutdown behavior.
+
+The embedded API remains available independently of the TCP server:
 
 ```go
 package main
@@ -116,6 +143,18 @@ An append, mutation synchronization, read I/O, or detected integrity failure fau
 
 A missing `data.log` with a nonempty `LOCK` or `.compact-*` artifacts is an error, not an empty database. Existing valid logs with an empty `LOCK` are marked after validation. Leftover compaction files are ignored when the authoritative log exists; startup neither promotes nor removes them.
 
+## Server and rate limiting
+
+The server handles each connection sequentially in one goroutine. Separate clients share the engine's concurrency controls. Defaults are 128 simultaneous connections, a 2 MiB JSON frame limit, a 30-second deadline to read each frame, and a five-second deadline to write each response. A connection beyond capacity closes immediately. Maximum decoded key and value sizes match the embedded API. These limits bound individual connections and frames; they do not impose a total database size or index-memory quota.
+
+The token bucket uses the peer socket's IP address, independent of source port, so opening a new connection does not reset its budget. Defaults allow a burst of 100 requests and refill 50 tokens per second. Complete, well-formed frames consume budget before command validation; denied requests do not reach storage. A `RATE_LIMITED` response includes `retry_after_ms` and leaves the connection usable. A limiter failure rejects the command with `UNAVAILABLE`.
+
+DiskKV imports `github.com/Ahmad-Mosha/rate-limiter/limiter` at the pinned Go pseudo-version `v0.0.0-20260902172527-59b884aab31c`; the algorithm is neither copied nor modified. Both modules require Go 1.25. Configuration validation rejects invalid capacities, nonfinite or nonpositive refill rates, and refill periods above 24 hours before starting resources. The upstream package also includes a Redis implementation, so its Redis client and supporting packages appear in the dependency graph; this server uses the in-memory bucket and requires no Redis service.
+
+Limiter state resets on restart. The upstream implementation periodically removes buckets idle long enough to refill, but has no hard cap on distinct IP entries. Connection limits therefore do not establish a strict bound on limiter memory under sustained IP churn. Clients sharing an IP share a budget. An intervening TCP proxy is the peer unless it preserves source addresses; the protocol accepts no client-supplied identity override.
+
+On shutdown, the server stops accepting connections, closes idle connections, and allows admitted commands and their responses to finish. After the configured deadline, it closes remaining connections and exits with an error. Filesystem I/O cannot be canceled by closing a socket. If drain times out, the command skips a blocking database close and lets process exit release resources. A lost response, write failure, or timeout can leave a mutation's outcome uncertain; reconnect and inspect application state rather than assuming rollback.
+
 ## Verification
 
 ```sh
@@ -126,27 +165,28 @@ go test -race -cover ./...
 go test ./engine -run '^$' -fuzz '^FuzzDecodeRecord$' -fuzztime 10s
 ```
 
-The test suite exercises serialization, truncation and corruption, reopen behavior, concurrent access, a reference-map workload, process locking, process termination, and injected I/O failures. Compaction tests cover logical-state preservation, replacement-stage failures, cleanup errors, and process termination around replacement. CI runs formatting, vet, build, and race-enabled tests on Linux and macOS. Passing race tests covers executed code paths; it is not a proof that every possible execution is race-free.
+The test suite exercises serialization, truncation and corruption, reopen behavior, concurrent access, a reference-map workload, process locking, process termination, and injected I/O failures. Compaction tests cover logical-state preservation, replacement-stage failures, cleanup errors, and process termination around replacement. Protocol and networking tests cover framing, malformed and oversized input, request limits, connection lifecycle, deadlines, shutdown, CLI behavior, and restart persistence. CI runs formatting, vet, build, and race-enabled tests on Linux and macOS. Passing race tests covers executed code paths; it is not a proof that every possible execution is race-free.
 
 ## Repository structure
 
 ```text
 engine/                 Storage engine, codec, recovery, compaction, and colocated tests
-docs/                   Storage format, durability contract, and compaction protocol
+internal/protocol/      Bounded JSON framing and request/response validation
+internal/server/        TCP lifecycle, dispatch, and rate-limiter integration
+cmd/diskkv/             Server executable
+cmd/diskkv-cli/         One-shot command-line client
+docs/                   Storage format, durability, compaction, and TCP protocol
 .github/workflows/      Continuous integration
 go.mod                  Go module and dependency versions
 ```
 
-The public `engine` package owns persistence and concurrency. Its tests live beside the code they exercise. Documentation describes current guarantees and explicitly labels future work; server and CLI packages will be added with their implementation milestone.
+The public `engine` package owns persistence and concurrency. Internal packages keep transport and request handling separate from storage. Executables compose those packages and own process-level resources. Tests live beside the code they exercise.
 
 ## Limits and next milestones
 
 The current engine uses one data file and synchronizes each mutation separately. Writes and compaction exclude readers. Recovery scans the entire log, and the index consumes memory proportional to the number and size of live keys. Updates and deletions accumulate obsolete records until manual compaction. Compaction needs extra disk space for the replacement and temporarily retains both indexes in memory. Locks are advisory: external programs must not modify files behind an open database.
 
-The remaining milestones are:
-
-1. A bounded TCP protocol and CLI, protected by the existing [Go Rate Limiter](https://github.com/Ahmad-Mosha/rate-limiter) module without duplicating its implementation.
-2. Reproducible benchmarks and a final engineering review. Measurements will cover sync overhead, reads/writes, recovery, concurrency, and compaction; no performance results are published yet.
+The remaining milestone is reproducible benchmarks and a final engineering review. Measurements will cover sync overhead, reads/writes, recovery, concurrency, and compaction; no performance results are published yet.
 
 TTL, distributed operation, multi-key transactions, and background compaction are outside the MVP.
 
