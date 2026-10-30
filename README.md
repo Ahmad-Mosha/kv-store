@@ -1,41 +1,84 @@
 # DiskKV
 
-A persistent key-value storage engine in Go, built around an append-only data log, a rebuildable in-memory index, and explicit failure handling.
+[![CI](https://github.com/Ahmad-Mosha/kv-store/actions/workflows/ci.yml/badge.svg)](https://github.com/Ahmad-Mosha/kv-store/actions/workflows/ci.yml)
 
-DiskKV provides an **embedded storage engine and a bounded TCP server**, with a command-line client and per-IP request limits. Each successful mutation is synchronized to the data file before its index entry becomes visible. Startup validates the log rather than silently discarding damaged records.
+DiskKV is a key-value storage engine I wrote in Go to learn how databases keep
+data safe on disk. It follows the Bitcask design: every write is appended to
+one log file, and an in-memory index maps each key to the position of its
+latest value in that file.
 
-## Implemented
+The main goal was correctness, not features. A write is synced to disk before
+it becomes visible to readers. On startup the engine checks every record and
+refuses to open a damaged file instead of silently dropping data. After a
+storage error, the database stops accepting operations instead of guessing.
 
-- Binary keys and values, with `Set`, `Get`, `Delete`, and `Exists`.
-- A versioned record format with separate CRC32C checksums for metadata and payload.
-- An in-memory key-to-offset index; values remain in the data file.
-- Concurrent access through a read/write lock and positional reads.
-- Strict recovery, explicit incomplete-tail repair, and a faulted state after storage failures.
-- Exclusive advisory locking on Linux and macOS.
-- Manual compaction with synchronized file replacement and replacement-stage fault injection.
-- A newline-delimited JSON protocol for binary-safe `SET`, `GET`, `DELETE`, and `EXISTS` commands.
-- Connection, frame-size, and network deadline limits, with graceful shutdown of admitted requests.
-- Per-IP token buckets from the existing [Go Rate Limiter](https://github.com/Ahmad-Mosha/rate-limiter) module.
+You can use it as a Go package or run it as a small TCP server with a
+command-line client.
 
-## Architecture
+Numbers from my machine (Apple M1 Pro, SSD, details in the
+[benchmark report](docs/benchmarks.md)):
 
-```mermaid
-flowchart LR
-    CLI[CLI / TCP client] --> Protocol[Bounded JSON protocol]
-    Protocol --> Limits[Per-IP rate limiter]
-    Limits --> Engine[DiskKV engine]
-    Caller[Go caller] --> Engine
-    Engine --> Index[In-memory index]
-    Engine --> Log[Append-only data.log]
-    Log --> Recovery[Validated startup replay]
-    Recovery --> Index
-```
+| Operation | Median |
+|---|---:|
+| Get, 1 KiB value | 1.2 µs |
+| Set, 1 KiB value, including fsync | 4.3 ms |
+| Startup recovery, 10,000 records | 25.7 ms |
 
-`Set` encodes one record, appends it, calls `Sync`, and then updates the index while holding the exclusive lock. `Delete` appends a tombstone for an existing key. `Get` holds a read lock while it reads the indexed record with `ReadAt` and verifies its checksum and identity. `Exists` checks index membership without reading or validating the value.
+Writes are slow because each `Set` waits for its own fsync. That is the price
+of the durability rule above, and it is the first thing I want to improve
+(see [Scope and limitations](#scope-and-limitations)).
 
-On startup, DiskKV checks the file header and every record, applies replacements and tombstones in order, and rebuilds the index. The log is the source of truth; there is no separate write-ahead log or persisted index.
+## What is built
 
-`Compact` pauses operations, validates and copies current live records into a sibling temporary file, synchronizes it, renames it over the data file, synchronizes the directory, and publishes the new handle and index. The [compaction protocol](docs/compaction-design.md) defines the behavior of each failure stage.
+- `Set`, `Get`, `Delete` and `Exists` on binary keys and values.
+- A versioned record format with CRC32C checksums, one for the record header
+  and one for the key and value.
+- An in-memory index from key to file offset. Values stay in the file and
+  are read with positional reads (`ReadAt`).
+- A read/write lock: many readers at once, one writer at a time.
+- Strict recovery on startup, and a separate `RepairTail` command to cut off
+  a half-written last record when you decide to.
+- A "faulted" state after any write, sync or integrity failure.
+- A lock file so two processes cannot open the same database (Linux and
+  macOS).
+- Manual compaction that rewrites only the live records into a new file and
+  swaps it in safely.
+- A TCP server with a newline-delimited JSON protocol, connection and frame
+  limits, timeouts, graceful shutdown, and per-IP rate limiting using my
+  [rate-limiter](https://github.com/Ahmad-Mosha/rate-limiter) module.
+- A CLI client.
+
+## How it works
+
+**Write path.** `Set` encodes one record, appends it to `data.log`, calls
+`Sync`, and only then updates the index, all under the write lock. So a reader
+can never see a value that is not on disk yet. `Delete` appends a tombstone
+record.
+
+**Read path.** `Get` takes the read lock, looks up the offset in the index,
+reads the record with `ReadAt`, and checks its checksum and key before
+returning the value.
+
+**Startup.** The log is the only source of truth. There is no separate
+write-ahead log and no saved index. `Open` reads the file from the start,
+validates each record, applies sets and deletes in order, and rebuilds the
+index.
+
+**Compaction.** Old values and deleted keys stay in the log until compaction.
+`Compact` copies the live records into a temporary file, syncs it, renames it
+over `data.log`, and syncs the directory. Each failure point is described in
+the [compaction design](docs/compaction-design.md).
+
+## Design decisions
+
+| Decision | Why | Cost |
+|---|---|---|
+| Append-only log with an in-memory index (Bitcask) | Simple to make crash-safe: a record is either fully written or it is the broken last record | All keys must fit in memory, and startup reads the whole log |
+| fsync on every `Set` before it returns | A successful write is on disk; no lost acknowledged writes after a process crash | About 4 ms per write, and readers wait behind it |
+| Refuse to open a damaged log | Silently skipping bad records hides data loss | An operator has to run `RepairTail` on purpose |
+| Two checksums per record | A bad header is detected before trusting the lengths inside it | 8 extra bytes per record |
+| Manual compaction | Easier to reason about and test every failure stage | The log grows until someone calls `Compact` |
+| JSON lines over TCP | Easy to debug with any client; binary data is base64 | Larger than a binary protocol |
 
 ## Quick start
 
@@ -206,6 +249,8 @@ The public `engine` package owns persistence and concurrency. Internal packages 
 ## Scope and limitations
 
 The current engine uses one data file and synchronizes each mutation separately. Writes and compaction exclude readers. Recovery scans the entire log, and the index consumes memory proportional to the number and size of live keys. Updates and deletions accumulate obsolete records until manual compaction. Compaction needs extra disk space for the replacement and temporarily retains both indexes in memory. Locks are advisory: external programs must not modify files behind an open database.
+
+The next step is group commit: let concurrent writers share one fsync instead of paying for one each. My benchmarks show why it matters: a 95% read / 5% write mix costs about 223 µs per operation, compared with 2.5 µs for reads alone, because readers wait behind each synced write.
 
 TTL, distributed operation, multi-key transactions, and background compaction are outside the MVP.
 
